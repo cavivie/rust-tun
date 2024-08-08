@@ -19,6 +19,12 @@ use std::io::Error;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::codec::Framed;
+use windows_sys::Win32::{
+    Foundation::{
+        CloseHandle, GetLastError, FALSE, HANDLE, TRUE, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0,
+    },
+    System::Threading::{CreateEventA, SetEvent, WaitForMultipleObjects, INFINITE},
+};
 
 use super::TunPacketCodec;
 use crate::device::AbstractDevice;
@@ -103,51 +109,130 @@ impl AsyncWrite for AsyncDevice {
     }
 }
 
+/// A wrapper struct that allows a type to be Send and Sync
+#[derive(Copy, Clone, Debug)]
+struct UnsafeHandle(pub HANDLE);
+
+/// We never read from the pointer. It only serves as a handle we pass
+/// to the kernel or C code that doesn't have the same mutable aliasing
+/// restrictions we have in Rust.
+unsafe impl Send for UnsafeHandle {}
+unsafe impl Sync for UnsafeHandle {}
+
 struct WinSession {
     session: std::sync::Arc<wintun::Session>,
-    receiver: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-    _task: std::thread::JoinHandle<()>,
+    waker: std::sync::Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    shutdown_event: std::sync::Arc<UnsafeHandle>,
 }
 
 impl WinSession {
     fn new(session: std::sync::Arc<wintun::Session>) -> Result<WinSession, io::Error> {
         let session_reader = session.clone();
-        let (receiver_tx, receiver_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let task = std::thread::spawn(move || loop {
-            match session_reader.receive_blocking() {
-                Ok(packet) => {
-                    if let Err(err) = receiver_tx.send(packet.bytes().to_vec()) {
-                        log::error!("{}", err);
-                        break;
+        let waker = std::sync::Arc::new(std::sync::Mutex::new(None::<std::task::Waker>));
+        let shutdown_event = unsafe {
+            let handle_ptr = CreateEventA(std::ptr::null_mut(), FALSE, FALSE, std::ptr::null_mut());
+            if handle_ptr.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            std::sync::Arc::new(UnsafeHandle(handle_ptr))
+        };
+
+        let task = std::thread::spawn({
+            let wait_waker = waker.clone();
+            let read_wait_event = session_reader.get_read_wait_event().unwrap();
+            let shutdown_event = shutdown_event.clone();
+            move || {
+                let handles = [read_wait_event, shutdown_event.0 as wintun::HANDLE];
+                loop {
+                    // SAFETY: We abide by the requirements of WaitForMultipleObjects,
+                    // an event handle is a pointer to valid, aligned, stack memory.
+                    let result = unsafe {
+                        WaitForMultipleObjects(
+                            handles.len() as _,
+                            handles.as_ptr() as _,
+                            FALSE,
+                            INFINITE,
+                        )
+                    };
+                    const WAIT_OBJECT_1: WAIT_EVENT = WAIT_OBJECT_0 + 1;
+                    match result {
+                        WAIT_OBJECT_0 => {
+                            // We have data, then wake up the wating waker.
+                            if let Some(waker) = wait_waker.lock().unwrap().take() {
+                                waker.wake();
+                            }
+                        }
+                        WAIT_OBJECT_1 => {
+                            // We receive a shutdown signal, close the session.
+                            break;
+                        }
+                        WAIT_FAILED => {
+                            // We don’t know the exact reason for the failure.
+                            let last_error_code = unsafe { GetLastError() };
+                            log::warn!(
+                                "WaitForMultipleObjects failed, last error: {:?}",
+                                last_error_code
+                            );
+                        }
+                        _ => {
+                            // This should never happen on all cases matched.
+                            unreachable!(
+                                "WaitForMultipleObjects returned unexpected result {:?}",
+                                result
+                            );
+                        }
                     }
                 }
-                Err(err) => {
-                    log::info!("{}", err);
-                    break;
-                }
+                // SAFETY: We only close this valid shutdown handle once.
+                _ = unsafe { CloseHandle(shutdown_event.0 as _) };
             }
         });
 
         Ok(WinSession {
             session,
-            receiver: receiver_rx,
-            _task: task,
+            waker,
+            thread: Some(task),
+            shutdown_event,
         })
+    }
+}
+
+impl Drop for WinSession {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            // SAFETY: We can set the shutdown event handle to the
+            // signaled state when the shutdown handle is not close.
+            if unsafe { SetEvent(self.shutdown_event.0) } == TRUE {
+                // Only join the event thread which may be responsive.
+                _ = thread.join();
+            } else {
+                // We won't join the thread which may be unresponsive.
+                let last_error_code = unsafe { GetLastError() };
+                log::warn!("SetEvent failed, last error: {:?}", last_error_code);
+            }
+        }
     }
 }
 
 impl AsyncRead for WinSession {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match std::task::ready!(self.receiver.poll_recv(cx)) {
-            Some(bytes) => {
-                buf.put_slice(&bytes);
+        match self.session.try_receive() {
+            Ok(Some(bytes)) => {
+                // We have data, then copy and push to the buffer.
+                buf.put_slice(&bytes.bytes());
                 std::task::Poll::Ready(Ok(()))
             }
-            None => std::task::Poll::Ready(Ok(())),
+            Ok(None) => {
+                // Ensure the future can wake up when we have data.
+                self.waker.lock().unwrap().replace(cx.waker().clone());
+                Poll::Pending
+            }
+            Err(err) => Poll::Ready(Err(err.into())),
         }
     }
 }
